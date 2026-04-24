@@ -1,4 +1,3 @@
-import { Readable } from 'stream';
 import {
   BlobServiceClient,
   StorageSharedKeyCredential,
@@ -11,7 +10,7 @@ const avro = require('avsc') as {
   streams: { BlockDecoder: new () => NodeJS.WritableStream & NodeJS.ReadableStream };
 };
 
-// ── Public types ─────────────────────────────────────────────────────────────
+// ── Public types ──────────────────────────────────────────────────────────────
 
 export interface ChangeFeedEvent {
   path: string;
@@ -27,7 +26,18 @@ export interface ChangeFeedOptions {
    * For Azure SDK HTTP-level logs, set AZURE_LOG_LEVEL=verbose in your environment.
    */
   verbose?: boolean;
+  /**
+   * Maximum number of HTTP operations (manifest downloads, chunk listings,
+   * avro downloads) that may be in flight at the same time.
+   *
+   * Raise for faster reads on a high-bandwidth connection.
+   * Lower if Azure returns 429 (TooManyRequests) errors.
+   * Default: 20.
+   */
+  concurrency?: number;
 }
+
+const DEFAULT_CONCURRENCY = 20;
 
 // ── Client factory helpers ────────────────────────────────────────────────────
 
@@ -45,10 +55,7 @@ export function createClientFromAccountKey(
   accountKey: string
 ): BlobServiceClient {
   const credential = new StorageSharedKeyCredential(accountName, accountKey);
-  return new BlobServiceClient(
-    `https://${accountName}.blob.core.windows.net`,
-    credential
-  );
+  return new BlobServiceClient(`https://${accountName}.blob.core.windows.net`, credential);
 }
 
 /**
@@ -63,7 +70,47 @@ export function createClientFromDefaultCredential(accountName: string): BlobServ
   );
 }
 
-// ── Internal helpers ─────────────────────────────────────────────────────────
+// ── Semaphore ─────────────────────────────────────────────────────────────────
+
+/**
+ * Bounds the number of concurrently running async operations.
+ *
+ * All HTTP work (manifest downloads, chunk listings, avro downloads) shares one
+ * Semaphore instance so the total number of in-flight requests never exceeds
+ * `limit`, regardless of how many nested Promise.all layers are active.
+ */
+class Semaphore {
+  private slots: number;
+  private readonly waiters: Array<() => void> = [];
+
+  constructor(limit: number) {
+    this.slots = limit;
+  }
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    // Block until a slot is free.
+    await new Promise<void>((resolve) => {
+      if (this.slots > 0) {
+        this.slots--;
+        resolve();
+      } else {
+        this.waiters.push(resolve);
+      }
+    });
+    try {
+      return await fn();
+    } finally {
+      // Release the slot; wake the oldest waiter if any.
+      if (this.waiters.length > 0) {
+        this.waiters.shift()!();
+      } else {
+        this.slots++;
+      }
+    }
+  }
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
 
 function makeLog(verbose: boolean): (msg: string) => void {
   if (!verbose) return () => {};
@@ -73,7 +120,6 @@ function makeLog(verbose: boolean): (msg: string) => void {
   };
 }
 
-/** Formats a RestError (Azure SDK) or plain Error into a readable string. */
 function formatError(err: unknown): string {
   if (err instanceof RestError) {
     const code = err.code ? ` [${err.code}]` : '';
@@ -82,7 +128,7 @@ function formatError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/** Collects a Node.js readable stream into a Buffer. */
+/** Collects a Node.js readable stream into a Buffer (used for small JSON files). */
 function streamToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -92,18 +138,22 @@ function streamToBuffer(stream: NodeJS.ReadableStream): Promise<Buffer> {
   });
 }
 
-/** Parses an Avro Object Container File buffer into a list of records. */
-function parseAvroBuffer(buf: Buffer): Promise<Record<string, unknown>[]> {
+/**
+ * Pipes the download stream directly into the Avro BlockDecoder.
+ *
+ * Faster than the buffer-then-parse approach because:
+ *   - Decoding starts as soon as the first bytes arrive over the network.
+ *   - No intermediate Buffer allocation for the entire file contents.
+ */
+function parseAvroStream(stream: NodeJS.ReadableStream): Promise<Record<string, unknown>[]> {
   return new Promise((resolve, reject) => {
     const records: Record<string, unknown>[] = [];
     const decoder = new avro.streams.BlockDecoder();
     (decoder as NodeJS.EventEmitter).on('data', (r: Record<string, unknown>) => records.push(r));
     (decoder as NodeJS.EventEmitter).on('end', () => resolve(records));
     (decoder as NodeJS.EventEmitter).on('error', reject);
-    const readable = new Readable({ read() {} });
-    readable.push(buf);
-    readable.push(null);
-    readable.pipe(decoder as unknown as NodeJS.WritableStream);
+    stream.on('error', reject);
+    stream.pipe(decoder as unknown as NodeJS.WritableStream);
   });
 }
 
@@ -135,7 +185,7 @@ function blobPathFromSubject(subject: string): string {
  * Pass a BlobServiceClient created via one of:
  *   createClientFromConnectionString(connStr)
  *   createClientFromAccountKey(accountName, accountKey)
- *   createClientFromDefaultCredential(accountName)   ← Managed Identity / Azure CLI
+ *   createClientFromDefaultCredential(accountName)  ← Managed Identity / Azure CLI
  *
  * Set AZURE_LOG_LEVEL=verbose in your environment for Azure SDK HTTP-level logs.
  */
@@ -144,15 +194,20 @@ export async function readChangeFeed(
   options: ChangeFeedOptions = {}
 ): Promise<ChangeFeedEvent[]> {
   const { startTime, endTime } = options;
+  const concurrency = options.concurrency ?? DEFAULT_CONCURRENCY;
   const log = makeLog(options.verbose ?? false);
   const container = client.getContainerClient('$blobchangefeed');
+  const startedAt = Date.now();
 
-  log(`Account   : ${client.accountName}`);
-  log(`Endpoint  : ${client.url}`);
-  log(`Time range: ${startTime?.toISOString() ?? '(none)'} → ${endTime?.toISOString() ?? '(none)'}`);
+  log(`Account     : ${client.accountName}`);
+  log(`Endpoint    : ${client.url}`);
+  log(`Time range  : ${startTime?.toISOString() ?? '(none)'} → ${endTime?.toISOString() ?? '(none)'}`);
+  log(`Concurrency : ${concurrency} simultaneous HTTP operations`);
   log(`Tip: set AZURE_LOG_LEVEL=verbose for Azure SDK HTTP-level logs\n`);
 
-  // ── Step 1: Read meta/segments.json ────────────────────────────────────────
+  // ── Step 1: Read meta/segments.json ──────────────────────────────────────────
+  // Must be done first — gives us lastConsumable, the boundary beyond which
+  // segments are still being written and must not be consumed yet.
   log('Step 1: Reading meta/segments.json …');
 
   let lastConsumable: Date;
@@ -171,9 +226,9 @@ export async function readChangeFeed(
     if (err instanceof RestError) {
       if (err.statusCode === 404) {
         log('  → Blob not found. Is change feed enabled on this storage account?');
-        log('    Enable it in Azure Portal → Storage Account → Data Protection → Enable blob change feed');
+        log('    Enable it: Azure Portal → Storage Account → Data Protection → Enable blob change feed');
       } else if (err.statusCode === 403) {
-        log('  → Access denied. Verify your credentials have "Storage Blob Data Reader" role or use the account key.');
+        log('  → Access denied. Verify credentials have "Storage Blob Data Reader" role or use the account key.');
       } else if (err.statusCode === 401) {
         log('  → Unauthenticated. Check your connection string or account key.');
       }
@@ -181,7 +236,8 @@ export async function readChangeFeed(
     throw new Error(`Failed to read segments.json: ${msg}`);
   }
 
-  // ── Step 2: List segment manifests ─────────────────────────────────────────
+  // ── Step 2: List segment manifests ───────────────────────────────────────────
+  // The SDK's listBlobsFlat handles pagination internally via its async generator.
   log('\nStep 2: Listing segment manifests under idx/segments/ …');
 
   const segmentManifests: string[] = [];
@@ -193,23 +249,20 @@ export async function readChangeFeed(
       }
     }
   } catch (err) {
-    const msg = formatError(err);
-    log(`  ERROR listing blobs: ${msg}`);
-    throw new Error(`Failed to list segment manifests: ${msg}`);
+    throw new Error(`Failed to list segment manifests: ${formatError(err)}`);
   }
 
-  log(`  Total segment manifests: ${segmentManifests.length}`);
-
+  log(`  Total: ${segmentManifests.length} segment manifest(s)`);
   if (segmentManifests.length === 0) {
     log('  → No segment manifests found. The change feed has no events yet.');
     return [];
   }
 
-  // ── Step 3: Filter segments by time range ──────────────────────────────────
+  // ── Step 3: Filter segments by time range ────────────────────────────────────
+  // Per Azure docs: segment times are approximate (±15 min), so we widen the
+  // filter by ±1 h and then apply the precise filter per-record by eventTime.
   log('\nStep 3: Filtering segments by time range …');
 
-  // Per Azure docs: segment times are approximate (±15 min), so buffer ±1 h
-  // to ensure all relevant events are captured, then filter precisely by eventTime.
   const rangeStart = startTime ? new Date(startTime.getTime() - 3_600_000) : null;
   const rangeEnd = endTime ? new Date(endTime.getTime() + 3_600_000) : null;
   if (rangeStart) log(`  Effective start (startTime − 1 h): ${rangeStart.toISOString()}`);
@@ -231,107 +284,134 @@ export async function readChangeFeed(
       relevantSegments.push(segPath);
     }
 
-    log(`  ${segPath} [segment time: ${t.toISOString()}] → ${verdict}`);
+    log(`  ${segPath} [${t.toISOString()}] → ${verdict}`);
   }
 
   log(`  Segments to process: ${relevantSegments.length} / ${segmentManifests.length}`);
-
   if (relevantSegments.length === 0) {
     log('  → All segments are outside the requested time range.');
     return [];
   }
 
-  // ── Steps 4–6: Read manifests → list Avro files → parse records ────────────
+  // ── Steps 4–6: Parallel pipeline ─────────────────────────────────────────────
+  //
+  // BEFORE (sequential): the three inner steps ran one after another — each
+  // segment waited for the previous, each chunk waited for its segment, etc.
+  //
+  // NOW (parallel pipeline):
+  //   • All segments launch simultaneously via Promise.all.
+  //   • As soon as a segment manifest is downloaded, its chunks start listing
+  //     immediately — without waiting for other manifests to finish.
+  //   • As soon as a chunk's avro list is ready, downloads start immediately —
+  //     without waiting for other chunks.
+  //   • A single Semaphore shared across all three levels caps the total number
+  //     of in-flight HTTP requests at `concurrency` at any moment.
+  //   • Array.push() is safe to call from multiple concurrent async tasks because
+  //     Node.js is single-threaded; awaits never run truly in parallel.
+  //
+  log(`\nSteps 4–6: Parallel pipeline — ${relevantSegments.length} segment(s), concurrency: ${concurrency} …`);
+
+  const sem = new Semaphore(concurrency);
   const events: ChangeFeedEvent[] = [];
-  let totalRecords = 0;
-  let skippedControl = 0;
-  let skippedTimeFilter = 0;
+  const stats = { records: 0, control: 0, filtered: 0, errors: 0 };
 
-  for (let si = 0; si < relevantSegments.length; si++) {
-    const segPath = relevantSegments[si];
-    log(`\nStep 4 [${si + 1}/${relevantSegments.length}]: Reading segment manifest ${segPath} …`);
+  await Promise.all(
+    relevantSegments.map(async (segPath) => {
 
-    // Read segment manifest (chunkFilePaths tell us which shard directories to look in)
-    let manifest: { chunkFilePaths: string[]; status: string };
-    try {
-      const blob = container.getBlobClient(segPath);
-      const response = await blob.download();
-      const text = (await streamToBuffer(response.readableStreamBody!)).toString('utf8');
-      manifest = JSON.parse(text) as { chunkFilePaths: string[]; status: string };
-      log(`  status        : ${manifest.status}`);
-      log(`  chunkFilePaths: ${manifest.chunkFilePaths.join(', ') || '(none)'}`);
-    } catch (err) {
-      log(`  ERROR: ${formatError(err)} — skipping this segment`);
-      continue;
-    }
-
-    for (const chunkPath of manifest.chunkFilePaths) {
-      // chunkPath = "$blobchangefeed/log/00/YYYY/MM/DD/HHMM/"
-      // Strip the container name prefix to get the blob prefix within the container.
-      const prefix = chunkPath.replace(/^\$blobchangefeed\//, '');
-      log(`\n  Step 5: Listing Avro files at prefix "${prefix}" …`);
-
-      const avroFiles: string[] = [];
-      try {
-        for await (const blob of container.listBlobsFlat({ prefix })) {
-          if (blob.name.endsWith('.avro')) {
-            avroFiles.push(blob.name);
-            log(`    Found: ${blob.name} (${blob.properties.contentLength ?? '?'} bytes)`);
-          }
-        }
-      } catch (err) {
-        log(`    ERROR listing Avro files: ${formatError(err)} — skipping this chunk`);
-        continue;
-      }
-
-      log(`    Avro files in chunk: ${avroFiles.length}`);
-
-      for (const avroPath of avroFiles) {
-        log(`\n    Step 6: Downloading and parsing ${avroPath} …`);
-
-        let records: Record<string, unknown>[];
+      // ── Step 4: Download segment manifest ──────────────────────────────────
+      // sem.run returns the value directly so TypeScript can narrow the type.
+      // (Assigning to a `let` inside a closure prevents TypeScript from tracking
+      // the narrowed type, causing it to infer `never` after a null-check.)
+      const manifest = await sem.run(async () => {
         try {
-          const blob = container.getBlobClient(avroPath);
-          const response = await blob.download();
-          const buf = await streamToBuffer(response.readableStreamBody!);
-          log(`      Downloaded: ${buf.length} bytes`);
-          records = await parseAvroBuffer(buf);
-          log(`      Parsed: ${records.length} Avro record(s)`);
+          const response = await container.getBlobClient(segPath).download();
+          const text = (await streamToBuffer(response.readableStreamBody!)).toString('utf8');
+          const m = JSON.parse(text) as { chunkFilePaths: string[]; status: string };
+          log(`  ✓ Manifest ${segPath} → status: ${m.status}, chunks: ${m.chunkFilePaths.length}`);
+          return m;
         } catch (err) {
-          log(`      ERROR: ${formatError(err)} — skipping file`);
-          continue;
+          stats.errors++;
+          log(`  ✗ Manifest ${segPath}: ${formatError(err)} — skipping segment`);
+          return null;
         }
+      });
 
-        totalRecords += records.length;
+      if (!manifest) return;
 
-        for (const record of records) {
-          const eventType = record['eventType'] as string;
+      // All chunks within this segment are processed in parallel.
+      await Promise.all(
+        manifest.chunkFilePaths.map(async (chunkPath) => {
+          // Strip "$blobchangefeed/" to get the blob name prefix inside the container.
+          const prefix = chunkPath.replace(/^\$blobchangefeed\//, '');
 
-          if (eventType === 'Control') {
-            skippedControl++;
-            continue;
-          }
-
-          const eventTime = record['eventTime'] as string;
-          const t = new Date(eventTime);
-
-          if (startTime && t < startTime) { skippedTimeFilter++; continue; }
-          if (endTime && t > endTime) { skippedTimeFilter++; continue; }
-
-          events.push({
-            path: blobPathFromSubject(record['subject'] as string),
-            eventType,
-            eventTime,
+          // ── Step 5: List Avro files for this chunk ───────────────────────
+          // The entire listBlobsFlat call (all pages) runs as one throttled
+          // operation so the slot is not released between pages.
+          const avroFiles = await sem.run(async () => {
+            const files: string[] = [];
+            try {
+              for await (const blob of container.listBlobsFlat({ prefix })) {
+                if (blob.name.endsWith('.avro')) files.push(blob.name);
+              }
+              log(`    ✓ Chunk ${prefix} → ${files.length} avro file(s)`);
+            } catch (err) {
+              stats.errors++;
+              log(`    ✗ Chunk ${prefix}: ${formatError(err)} — skipping chunk`);
+            }
+            return files;
           });
-        }
-      }
-    }
-  }
 
-  log(`\nSummary:`);
-  log(`  Total Avro records parsed      : ${totalRecords}`);
-  log(`  Skipped (internal Control)     : ${skippedControl}`);
-  log(`  Skipped (outside time range)   : ${skippedTimeFilter}`);
+          // All avro files in this chunk are processed in parallel.
+          await Promise.all(
+            avroFiles.map(async (avroPath) => {
+
+              // ── Step 6: Download and parse Avro file ────────────────────
+              // The download stream is piped directly into the Avro decoder
+              // (parseAvroStream) rather than buffered first — decoding starts
+              // as the first bytes arrive over the network.
+              const records = await sem.run(async () => {
+                try {
+                  const response = await container.getBlobClient(avroPath).download();
+                  const recs = await parseAvroStream(response.readableStreamBody!);
+                  log(`      ✓ ${avroPath} → ${recs.length} record(s)`);
+                  return recs;
+                } catch (err) {
+                  stats.errors++;
+                  log(`      ✗ ${avroPath}: ${formatError(err)} — skipping file`);
+                  return [] as Record<string, unknown>[];
+                }
+              });
+
+              // Filter and collect — pure CPU, not throttled by the semaphore.
+              for (const record of records) {
+                stats.records++;
+                const eventType = record['eventType'] as string;
+                if (eventType === 'Control') { stats.control++; continue; }
+
+                const eventTime = record['eventTime'] as string;
+                const t = new Date(eventTime);
+                if (startTime && t < startTime) { stats.filtered++; continue; }
+                if (endTime && t > endTime) { stats.filtered++; continue; }
+
+                events.push({
+                  path: blobPathFromSubject(record['subject'] as string),
+                  eventType,
+                  eventTime,
+                });
+              }
+            })
+          );
+        })
+      );
+    })
+  );
+
+  const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+  log(`\nSummary (${elapsed}s elapsed):`);
+  log(`  Total Avro records parsed      : ${stats.records}`);
+  log(`  Skipped (internal Control)     : ${stats.control}`);
+  log(`  Skipped (outside time range)   : ${stats.filtered}`);
+  log(`  Errors (segments/files skipped): ${stats.errors}`);
   log(`  Events returned                : ${events.length}`);
 
   return events;
@@ -358,6 +438,7 @@ Authentication (one of):
 Options:
   --start <datetime>           Only return events at or after this time (ISO 8601)
   --end   <datetime>           Only return events at or before this time (ISO 8601)
+  --concurrency <n>            Max simultaneous HTTP operations (default: ${DEFAULT_CONCURRENCY})
   --verbose                    Print step-by-step progress to stderr
                                (Set AZURE_LOG_LEVEL=verbose for SDK HTTP logs)
 
@@ -397,12 +478,11 @@ if (require.main === module) {
     const i = argv.indexOf(flag);
     return i !== -1 ? argv[i + 1] : undefined;
   };
-  const startArg = get('--start');
-  const endArg = get('--end');
 
   const options: ChangeFeedOptions = {
-    startTime: startArg ? new Date(startArg) : undefined,
-    endTime: endArg ? new Date(endArg) : undefined,
+    startTime: get('--start') ? new Date(get('--start')!) : undefined,
+    endTime: get('--end') ? new Date(get('--end')!) : undefined,
+    concurrency: get('--concurrency') ? parseInt(get('--concurrency')!, 10) : undefined,
     verbose: argv.includes('--verbose'),
   };
 
