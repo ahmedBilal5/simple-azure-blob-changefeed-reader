@@ -1,8 +1,25 @@
 {
-  "name": "custom-blob-changefeed-reader",
+  "name": "simple-azure-blob-changefeed-reader",
   "version": "1.0.0",
-  "description": "Read Azure Blob Change Feed without the Azure SDK",
+  "description": "Read Azure Blob Storage Change Feed without the preview @azure/storage-blob-changefeed package",
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "keywords": [
+    "azure",
+    "blob",
+    "storage",
+    "change-feed",
+    "changefeed",
+    "avro"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc",
     "start": "ts-node src/index.ts",
@@ -15,7 +32,10 @@
     "dotenv": "^17.4.2"
   },
   "devDependencies": {
+    "@semantic-release/changelog": "^6.0.3",
+    "@semantic-release/git": "^10.0.1",
     "@types/node": "^20.0.0",
+    "semantic-release": "^24.0.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.3.0"
   }
