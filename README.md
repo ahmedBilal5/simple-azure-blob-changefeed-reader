@@ -1,6 +1,6 @@
 # simple-azure-blob-changefeed-reader
 
-A lightweight TypeScript library and CLI that reads the **Azure Blob Storage Change Feed** without the official `@azure/storage-blob-changefeed` preview package.
+A lightweight TypeScript library and CLI that reads the **Azure Blob Storage Change Feed** without the official `@azure/storage-blob-changefeed` package.
 
 ## Why This Package?
 
