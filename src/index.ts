@@ -6,6 +6,7 @@ import {
 import { DefaultAzureCredential } from '@azure/identity';
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
+
 const avro = require('avsc') as {
   streams: { BlockDecoder: new () => NodeJS.WritableStream & NodeJS.ReadableStream };
 };
