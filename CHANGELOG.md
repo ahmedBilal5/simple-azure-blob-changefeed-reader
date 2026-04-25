@@ -1,3 +1,10 @@
+## [1.0.2](https://github.com/ahmedBilal5/simple-azure-blob-changefeed-reader/compare/v1.0.1...v1.0.2) (2026-04-25)
+
+
+### Bug Fixes
+
+* optimized listblobsflat for ids/segments/ ([fee14de](https://github.com/ahmedBilal5/simple-azure-blob-changefeed-reader/commit/fee14de9aaab3fd2b9697d52c72c852fd2fa40f0))
+
 ## [1.0.1](https://github.com/ahmedBilal5/simple-azure-blob-changefeed-reader/compare/v1.0.0...v1.0.1) (2026-04-24)
 
 

@@ -1,6 +1,6 @@
 {
   "name": "simple-azure-blob-changefeed-reader",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Read Azure Blob Storage Change Feed without the @azure/storage-blob-changefeed package",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
