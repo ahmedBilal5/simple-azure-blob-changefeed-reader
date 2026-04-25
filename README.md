@@ -1,4 +1,4 @@
-> NOTE: This package was created with heavy usage of Claude Code. While the information below has been checked for correctness, do read with caution.  
+> NOTE: This package was created with heavy usage of Claude Code. While the information below has been checked for correctness, read and use with due caution.  
 
 # simple-azure-blob-changefeed-reader
 
