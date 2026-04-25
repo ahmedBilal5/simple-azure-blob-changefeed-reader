@@ -62,6 +62,7 @@ async function main() {
 
   console.log(`Found ${events.length} event(s):\n`);
   console.log(JSON.stringify(events, null, 2));
+  console.log("Total Events: ", events.length)
 }
 
 main().catch((err: Error) => {

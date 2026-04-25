@@ -170,6 +170,25 @@ function segmentPathToDate(segPath: string): Date {
 }
 
 /**
+ * Returns one `idx/segments/YYYY/MM/DD/` prefix per calendar day in [start, end].
+ * Returns [] when start > end (e.g. startTime is beyond lastConsumable).
+ * Date.UTC arithmetic handles month/year roll-overs automatically.
+ */
+function enumerateDayPrefixes(start: Date, end: Date): string[] {
+  const prefixes: string[] = [];
+  const cur = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()));
+  const last = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate()));
+  while (cur <= last) {
+    const y = cur.getUTCFullYear().toString().padStart(4, '0');
+    const mo = (cur.getUTCMonth() + 1).toString().padStart(2, '0');
+    const d = cur.getUTCDate().toString().padStart(2, '0');
+    prefixes.push(`idx/segments/${y}/${mo}/${d}/`);
+    cur.setUTCDate(cur.getUTCDate() + 1);
+  }
+  return prefixes;
+}
+
+/**
  * Extracts "<container>/<blobpath>" from an event's subject field.
  * Subject format: /blobServices/default/containers/<container>/blobs/<path>
  */
@@ -237,21 +256,58 @@ export async function readChangeFeed(
     throw new Error(`Failed to read segments.json: ${msg}`);
   }
 
+  // Semaphore is created here (before Step 2) so it is shared across both the
+  // parallel segment-manifest listings (Step 2) and the parallel pipeline (Steps 4–6).
+  const sem = new Semaphore(concurrency);
+
   // ── Step 2: List segment manifests ───────────────────────────────────────────
-  // The SDK's listBlobsFlat handles pagination internally via its async generator.
-  log('\nStep 2: Listing segment manifests under idx/segments/ …');
+  // When startTime is provided we enumerate only the relevant day-level prefixes
+  // (e.g. `idx/segments/2024/01/15/`) instead of scanning the entire tree.
+  // Each day holds at most ~96 entries (one per 15-min segment window), so total
+  // listing work is proportional to the query range, not the account's full history.
+  // Widening by 1 day on each side guarantees we cover the ±1 h buffer used in
+  // Step 3 (1 day >> 1 hour). All day-prefix listings run in parallel via the
+  // shared semaphore.
+  //
+  // When no startTime is given there is no lower-bound prefix to start from,
+  // so we fall back to a single full listing under idx/segments/.
+  log('\nStep 2: Listing segment manifests …');
+
+  let listPrefixes: string[];
+  if (startTime) {
+    const endBound = endTime ?? lastConsumable;
+    // Date.UTC handles roll-overs: day 0 → last day of previous month, etc.
+    const dateStart = new Date(Date.UTC(
+      startTime.getUTCFullYear(), startTime.getUTCMonth(), startTime.getUTCDate() - 1
+    ));
+    const dateEnd = new Date(Date.UTC(
+      endBound.getUTCFullYear(), endBound.getUTCMonth(), endBound.getUTCDate() + 1
+    ));
+    listPrefixes = enumerateDayPrefixes(dateStart, dateEnd);
+    log(`  startTime provided — ${listPrefixes.length} day-level prefix(es) listed in parallel`);
+    log(`  Date window : ${dateStart.toISOString().slice(0, 10)} → ${dateEnd.toISOString().slice(0, 10)}`);
+  } else {
+    listPrefixes = ['idx/segments/'];
+    log('  No startTime — listing full idx/segments/ tree');
+  }
 
   const segmentManifests: string[] = [];
-  try {
-    for await (const blob of container.listBlobsFlat({ prefix: 'idx/segments/' })) {
-      if (blob.name.endsWith('/meta.json')) {
-        segmentManifests.push(blob.name);
-        log(`  Found: ${blob.name}`);
-      }
-    }
-  } catch (err) {
-    throw new Error(`Failed to list segment manifests: ${formatError(err)}`);
-  }
+  await Promise.all(
+    listPrefixes.map((prefix) =>
+      sem.run(async () => {
+        try {
+          for await (const blob of container.listBlobsFlat({ prefix })) {
+            if (blob.name.endsWith('/meta.json')) {
+              segmentManifests.push(blob.name);
+              log(`  Found: ${blob.name}`);
+            }
+          }
+        } catch (err) {
+          throw new Error(`Failed to list segment manifests for ${prefix}: ${formatError(err)}`);
+        }
+      })
+    )
+  );
 
   log(`  Total: ${segmentManifests.length} segment manifest(s)`);
   if (segmentManifests.length === 0) {
@@ -312,7 +368,6 @@ export async function readChangeFeed(
   //
   log(`\nSteps 4–6: Parallel pipeline — ${relevantSegments.length} segment(s), concurrency: ${concurrency} …`);
 
-  const sem = new Semaphore(concurrency);
   const events: ChangeFeedEvent[] = [];
   const stats = { records: 0, control: 0, filtered: 0, errors: 0 };
 
