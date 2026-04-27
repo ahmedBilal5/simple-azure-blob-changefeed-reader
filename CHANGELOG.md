@@ -1,3 +1,10 @@
+## [1.0.3](https://github.com/ahmedBilal5/simple-azure-blob-changefeed-reader/compare/v1.0.2...v1.0.3) (2026-04-27)
+
+
+### Bug Fixes
+
+* a utility function added ([0394bbd](https://github.com/ahmedBilal5/simple-azure-blob-changefeed-reader/commit/0394bbd1c7e2a27675b7f9e47ada6958bdebf9de))
+
 ## [1.0.2](https://github.com/ahmedBilal5/simple-azure-blob-changefeed-reader/compare/v1.0.1...v1.0.2) (2026-04-25)
 
 
