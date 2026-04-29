@@ -1,3 +1,10 @@
+## [1.0.4](https://github.com/ahmedBilal5/simple-azure-blob-changefeed-reader/compare/v1.0.3...v1.0.4) (2026-04-29)
+
+
+### Bug Fixes
+
+* previousPath property for rename events, removed unneeded code ([0bfa4a6](https://github.com/ahmedBilal5/simple-azure-blob-changefeed-reader/commit/0bfa4a6342a59c47618695e6588d741d4db6eb13))
+
 ## [1.0.3](https://github.com/ahmedBilal5/simple-azure-blob-changefeed-reader/compare/v1.0.2...v1.0.3) (2026-04-27)
 
 
