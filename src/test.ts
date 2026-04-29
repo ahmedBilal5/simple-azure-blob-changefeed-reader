@@ -51,8 +51,7 @@ async function main() {
     console.log(`SDK logs  : AZURE_LOG_LEVEL=${process.env['AZURE_LOG_LEVEL']}`);
   }
   console.log('');
-
-  const events = await readChangeFeed(client, { startTime, endTime, verbose: true });
+  const events = (await readChangeFeed(client, { startTime, endTime, verbose: true }))
 
   console.log('');
   if (events.length === 0) {

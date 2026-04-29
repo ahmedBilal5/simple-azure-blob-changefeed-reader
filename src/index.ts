@@ -17,6 +17,12 @@ export interface ChangeFeedEvent {
   path: string;
   eventType: string;
   eventTime: string;
+  /**
+   * For BlobRenamed and DirectoryRenamed events only: the path before the rename,
+   * extracted from eventData.sourceUrl in the Avro record.
+   * Undefined for all other event types.
+   */
+  previousPath?: string;
 }
 
 export interface ChangeFeedOptions {
@@ -167,6 +173,20 @@ function segmentPathToDate(segPath: string): Date {
   if (!m) return new Date(0);
   const [, year, month, day, hour, minute] = m;
   return new Date(`${year}-${month}-${day}T${hour}:${minute}:00Z`);
+}
+
+/**
+ * Extracts "<container>/<path>" from a full Azure Storage URL.
+ * Handles both blob endpoint (account.blob.core.windows.net) and
+ * DFS endpoint (account.dfs.core.windows.net) used by ADLS Gen2.
+ * The pathname for both is "/<container>/<path>"; we strip the leading slash.
+ */
+function blobPathFromUrl(blobUrl: string): string {
+  try {
+    return new URL(blobUrl).pathname.replace(/^\//, '');
+  } catch {
+    return blobUrl;
+  }
 }
 
 /**
@@ -449,11 +469,14 @@ export async function readChangeFeed(
                 if (startTime && t < startTime) { stats.filtered++; continue; }
                 if (endTime && t > endTime) { stats.filtered++; continue; }
 
-                events.push({
-                  path: blobPathFromSubject(record['subject'] as string),
-                  eventType,
-                  eventTime,
-                });
+                const path = blobPathFromSubject(record['subject'] as string);
+                let previousPath: string | undefined;
+                if (eventType === 'BlobRenamed' || eventType === 'DirectoryRenamed') {
+                  const ed = record['data'] as Record<string, unknown> | null | undefined;
+                  const srcUrl = ed?.['srcUrl'] as string | undefined;
+                  if (srcUrl) previousPath = blobPathFromUrl(srcUrl);
+                }
+                events.push({ path, eventType, eventTime, ...(previousPath !== undefined ? { previousPath } : {}) });
               }
             })
           );
@@ -469,122 +492,10 @@ export async function readChangeFeed(
   log(`  Skipped (outside time range)   : ${stats.filtered}`);
   log(`  Errors (segments/files skipped): ${stats.errors}`);
   log(`  Events returned                : ${events.length}`);
-
+  events.sort((a, b) => a.eventTime.localeCompare(b.eventTime));
   return events;
 }
 
-// ── Effective-change computation ─────────────────────────────────────────────
-
-/** The cache synchronization action required for a blob path. */
-export type EffectiveSyncAction = 'upsert' | 'delete';
-
-/**
- * The net cache-synchronization action for a single blob path, after collapsing
- * all raw change-feed events for that path.
- */
-export interface EffectiveChange {
-  path: string;
-  /** 'upsert' — refresh this blob in the cache; 'delete' — evict it from the cache. */
-  action: EffectiveSyncAction;
-  /** ISO 8601 timestamp of the last event that determined this action. */
-  lastEventTime: string;
-  /** Event type of the last event that determined this action. */
-  lastEventType: string;
-}
-
-// Event types that signal "the blob existed before this event" when they appear
-// before a BlobCreated in the same path's event sequence.
-const MUTATION_EVENT_TYPES = new Set([
-  'BlobPropertiesUpdated',
-  'BlobMetadataUpdated',
-  'BlobTierChanged',
-  'BlobSnapshotCreated',
-  'BlobAsyncOperationInitiated',
-  'BlobRenamed',
-  'DirectoryRenamed',
-]);
-
-/**
- * Collapses a raw list of change-feed events into the minimal set of cache
- * synchronization actions — one per blob path.
- *
- * For each unique path, events are sorted chronologically and the net action
- * is determined as follows:
- *
- *   last ≠ deletion  →  'upsert'
- *     Blob currently exists and has changed; refresh it in the cache.
- *     Handles: [Create], [Create→Update→…], [Delete→Create], [Rename], etc.
- *
- *   last = deletion AND blob has evidence of pre-existing  →  'delete'
- *     Blob existed before the window and is now gone; evict from cache.
- *     "Evidence of pre-existing" means: any mutation event (PropertiesUpdated,
- *     MetadataUpdated, TierChanged, etc.) appears at any point in the sequence,
- *     OR the first event is not a creation.
- *     Handles: [Update→Delete], [Delete→Create→Delete], [Rename→Delete], etc.
- *
- *   last = deletion AND no evidence of pre-existing  →  SKIP (no action)
- *     Blob was created from scratch within the window and later deleted. It was
- *     never in the cache and is now gone; no cache operation is needed.
- *     Handles the primary use case: ephemeral blobs created and deleted within
- *     the same time window.
- *
- * Known limitation: BlobCreated also fires when an *existing* blob is overwritten
- * (same API call, no distinguishing field — confirmed against Azure documentation).
- * If an existing blob is overwritten (BlobCreated) and then deleted, with no other
- * events in between, it will be treated as SKIP instead of 'delete'. This cannot
- * be resolved without external state (e.g. checking if the path was in the cache
- * before the window). In practice this pattern is rare compared to the ephemeral
- * create-then-delete case that this function is designed to eliminate.
- *
- * @param events Raw events returned by readChangeFeed. Order does not matter.
- * @returns One EffectiveChange per path that requires a cache action.
- */
-export function computeEffectiveChanges(events: ChangeFeedEvent[]): EffectiveChange[] {
-  // Group events by path.
-  const byPath = new Map<string, ChangeFeedEvent[]>();
-  for (const event of events) {
-    const bucket = byPath.get(event.path);
-    if (bucket) bucket.push(event);
-    else byPath.set(event.path, [event]);
-  }
-
-  const result: EffectiveChange[] = [];
-
-  for (const [path, pathEvents] of byPath) {
-    // Sort ascending — events may arrive out of order when fetched in parallel.
-    pathEvents.sort((a, b) => a.eventTime.localeCompare(b.eventTime));
-
-    const first = pathEvents[0];
-    const last = pathEvents[pathEvents.length - 1];
-
-    const lastIsDelete = last.eventType === 'BlobDeleted' || last.eventType === 'DirectoryDeleted';
-
-    if (!lastIsDelete) {
-      result.push({ path, action: 'upsert', lastEventTime: last.eventTime, lastEventType: last.eventType });
-      continue;
-    }
-
-    // Last event is a deletion. Determine whether the blob pre-existed the window.
-    //
-    // Evidence of pre-existing:
-    //   (a) The first event is not a creation — the blob was already there.
-    //   (b) Any mutation event appears in the sequence — mutations only fire on
-    //       blobs that exist, so if one appears before any creation it confirms
-    //       prior existence. Even after a creation it widens the chance that a
-    //       BlobCreated was an overwrite rather than a first write.
-    const firstIsCreate = first.eventType === 'BlobCreated' || first.eventType === 'DirectoryCreated';
-    const hasMutationEvent = pathEvents.some((e) => MUTATION_EVENT_TYPES.has(e.eventType));
-
-    const blobPreExisted = !firstIsCreate || hasMutationEvent;
-
-    if (blobPreExisted) {
-      result.push({ path, action: 'delete', lastEventTime: last.eventTime, lastEventType: last.eventType });
-    }
-    // else: phantom create-then-delete — skip entirely
-  }
-
-  return result;
-}
 
 // ── CLI entry point ───────────────────────────────────────────────────────────
 
