@@ -471,12 +471,10 @@ export async function readChangeFeed(
                 
                 const path = blobPathFromSubject(record['subject'] as string);
                 let previousPath: string | undefined;
-                 console.log(JSON.stringify(record, null, 2));
                 if (eventType === 'BlobRenamed' || eventType === 'DirectoryRenamed') {
                   const ed = record['data'] as Record<string, unknown> | null | undefined;
                   const srcUrl = ed?.['srcUrl'] as string | undefined;
                   if (srcUrl) previousPath = blobPathFromUrl(srcUrl);
-                  console.log("ppath: ", previousPath);
                 }
                 events.push({ path, eventType, eventTime, ...(previousPath !== undefined ? { previousPath } : {}) });
               }
