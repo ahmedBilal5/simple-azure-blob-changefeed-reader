@@ -1,3 +1,10 @@
+## [1.0.5](https://github.com/ahmedBilal5/simple-azure-blob-changefeed-reader/compare/v1.0.4...v1.0.5) (2026-04-30)
+
+
+### Bug Fixes
+
+* decodeurl path ([d50a879](https://github.com/ahmedBilal5/simple-azure-blob-changefeed-reader/commit/d50a8792cde5735c668daa5f10a4fc03080e30dc))
+
 ## [1.0.4](https://github.com/ahmedBilal5/simple-azure-blob-changefeed-reader/compare/v1.0.3...v1.0.4) (2026-04-29)
 
 
