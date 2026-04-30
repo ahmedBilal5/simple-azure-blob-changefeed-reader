@@ -1,4 +1,4 @@
 node_modules
 .env
 .claude/
-output.txt
+output*.txt

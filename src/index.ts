@@ -183,7 +183,7 @@ function segmentPathToDate(segPath: string): Date {
  */
 function blobPathFromUrl(blobUrl: string): string {
   try {
-    return new URL(blobUrl).pathname.replace(/^\//, '');
+    return decodeURIComponent(new URL(blobUrl).pathname.replace(/^\//, ''));
   } catch {
     return blobUrl;
   }
@@ -468,13 +468,15 @@ export async function readChangeFeed(
                 const t = new Date(eventTime);
                 if (startTime && t < startTime) { stats.filtered++; continue; }
                 if (endTime && t > endTime) { stats.filtered++; continue; }
-
+                
                 const path = blobPathFromSubject(record['subject'] as string);
                 let previousPath: string | undefined;
+                 console.log(JSON.stringify(record, null, 2));
                 if (eventType === 'BlobRenamed' || eventType === 'DirectoryRenamed') {
                   const ed = record['data'] as Record<string, unknown> | null | undefined;
                   const srcUrl = ed?.['srcUrl'] as string | undefined;
                   if (srcUrl) previousPath = blobPathFromUrl(srcUrl);
+                  console.log("ppath: ", previousPath);
                 }
                 events.push({ path, eventType, eventTime, ...(previousPath !== undefined ? { previousPath } : {}) });
               }
