@@ -1,3 +1,10 @@
+## [1.0.6](https://github.com/ahmedBilal5/simple-azure-blob-changefeed-reader/compare/v1.0.5...v1.0.6) (2026-04-30)
+
+
+### Bug Fixes
+
+* removed logs ([db7ab2e](https://github.com/ahmedBilal5/simple-azure-blob-changefeed-reader/commit/db7ab2ef1e55df85adf6457ff4aa9cd83a66eb7c))
+
 ## [1.0.5](https://github.com/ahmedBilal5/simple-azure-blob-changefeed-reader/compare/v1.0.4...v1.0.5) (2026-04-30)
 
 
